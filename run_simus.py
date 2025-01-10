@@ -14,7 +14,7 @@ def sample_and_estim(theta0, n, prng_key):
     z, y, t = model.simu_data(theta0, n, prng_key=key_simu)
     y_pd = pd.DataFrame(y,columns=["x_" + str(i) for i in range(1,21)])
     y_pd.to_csv('data/y'+str(key_simu)+'.txt')
-    res = algos.estim(y, t, stop_crit=1e-6, N_smooth=5000, prng_key=key_estim, pre_heating=2000)
+    res = algos.estim(y, t, stop_crit=1e-6, N_smooth=5000, prng_key=key_estim, smart_start=2000)
     return res
 
 
@@ -26,7 +26,10 @@ theta0 = model.parametrization.params_to_reals1d(
     var_residual=100,
 )
 
-Nsimus = 1
+covariates = namedtuple("covariates","t")
+cov = covariates(jnp.linspace(100,1500,20))
+
+Nsimus = 1000
 n = 1000
 keyy = 0
 many_res = list(
@@ -36,7 +39,7 @@ many_res = list(
             for key in jax.random.split(jax.random.PRNGKey(keyy), Nsimus)
         ),
         total=Nsimus,
-        smoothing=0,
+        smoothing=1000,
     )
 )
 

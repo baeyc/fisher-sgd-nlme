@@ -37,7 +37,7 @@ class O3filter:
 @jax.jit
 def mh_step_adaptative(*, sigma_proposal, current_ar, theta, z, y, t, prng_key):
     n, J = y.shape
-    assert t.shape == (n, J)
+    assert t.shape == (J,)
     assert z.shape == (n, 2)
     prng_key, key = jax.random.split(prng_key)
     naccept, z = model.mh_step_gibbs(theta, z, y, t, sigma_proposal, key)
@@ -56,7 +56,7 @@ def mh_step_adaptative(*, sigma_proposal, current_ar, theta, z, y, t, prng_key):
 def one_iter(
     *,
     it,
-    pre_heating,
+    smart_start,
     end_heating,
     theta,
     sigma_proposal,
@@ -70,18 +70,18 @@ def one_iter(
     prng_key,
 ):
     n, J = y.shape
-    assert t.shape == (n, J)
+    assert t.shape == (J,)
     assert z.shape == (n, 2)
 
     if end_heating is None:
         factor = jax.lax.cond(
-            it >= pre_heating,
+            it >= smart_start,
             lambda it: 1.0,
-            lambda it: jnp.exp((1 - it / pre_heating) * jnp.log(1e-4)),
+            lambda it: jnp.exp((1 - it / smart_start) * jnp.log(1e-4)),
             it,
         )
     else:
-        factor = (it - end_heating) ** (-2/3)
+        factor = (it - end_heating) ** (-2 / 3)
 
     (sigma_proposal, current_ar, z, prng_key) = mh_step_adaptative(
         sigma_proposal=sigma_proposal,
@@ -93,18 +93,19 @@ def one_iter(
         prng_key=prng_key,
     )
 
-    current_jac = model.jac_log_likelihood_rows(theta, z, y, t)
+    current_jac = -model.jac_log_likelihood_rows(theta, z, y, t)
     jac += factor * (current_jac - jac)
     fisher_info_mat = jac.T @ jac / n
     fisher_info_mat = jax.lax.cond(
-        it < pre_heating,
-        lambda fisher_info_mat: factor * fisher_info_mat + (1 - factor) * jnp.eye(model.parametrization.size),
+        it < smart_start,
+        lambda fisher_info_mat: factor * fisher_info_mat
+        + (1 - factor) * jnp.eye(model.parametrization.size),
         lambda fisher_info_mat: fisher_info_mat,
         fisher_info_mat,
     )
-    grad = current_jac.mean(axis=0)
+    grad = jac.mean(axis=0)
     theta_step = jnp.linalg.solve(fisher_info_mat, grad)
-    theta += factor * theta_step
+    theta -= factor * theta_step
 
     step_mean = factor * (theta_step - step_mean)
     grad_mean = factor * (grad - grad_mean)
@@ -129,7 +130,9 @@ def gsto(
     y,
     t,
     prng_key=None,
-    pre_heating=1000,
+    *,
+    preheating=1000,
+    smart_start=1000,
     theta0=None,
 ):
     if prng_key is None:
@@ -138,7 +141,7 @@ def gsto(
         prng_key = jax.random.PRNGKey(prng_key)
 
     n, J = y.shape
-    assert t.shape == (n, J)
+    assert t.shape == (J,)
 
     prng_key, key = jax.random.split(prng_key)
     if theta0 is None:
@@ -150,7 +153,7 @@ def gsto(
     current_ar = jnp.ones(1) * 0.4
 
     z = jnp.zeros((n, 2))
-    for _ in range(pre_heating):
+    for _ in range(preheating):
         (sigma_proposal, current_ar, z, prng_key) = mh_step_adaptative(
             sigma_proposal=sigma_proposal,
             current_ar=current_ar,
@@ -185,7 +188,7 @@ def gsto(
             fisher_info_mat,
         ) = one_iter(
             it=it,
-            pre_heating=pre_heating,
+            smart_start=smart_start,
             end_heating=end_heating,
             theta=theta,
             sigma_proposal=sigma_proposal,
@@ -203,7 +206,7 @@ def gsto(
             o3_filter.update(theta_step)
             o3_step_mean, old_o3_step_mean = o3_filter.unbiaised_m3, o3_step_mean
             if (
-                it > pre_heating
+                it > smart_start
                 and (o3_step_mean**2).sum() > (old_o3_step_mean**2).sum()
             ):
                 end_heating = it
@@ -220,24 +223,27 @@ def gsto(
         )
 
 
-def estim(y, t, stop_crit=1e-6, N_smooth=10000, prng_key=0, pre_heating=1000, theta=None):
+def estim(y, t, stop_crit=1e-6, N_smooth=10000, prng_key=0, smart_start=1000, theta=None):
     n, J = y.shape
-    assert t.shape == (n, J)
+    assert t.shape == (J,)
     usefull_values = list(
         itertools.islice(
-                gsto(y, t, prng_key=prng_key, pre_heating=pre_heating, theta0=theta),
+            itertools.dropwhile(
+                lambda x: (
+                    (x.end_heating is None) or 
+                    (x.step_mean @ x.grad_mean * 1000 > 1e-6)
+                ),
+                gsto(y, t, prng_key=prng_key, smart_start=smart_start, theta0=theta),
+            ),
             N_smooth,
         )
-    )    
+    )
     return ResEstim(
         jnp.array([x.theta for x in usefull_values]).mean(axis=0),
         jnp.array([x.theta for x in usefull_values]),
         jnp.array([x.factor for x in usefull_values]),        
         jnp.array([x.fisher_info_mat for x in usefull_values]).mean(axis=0),
         jnp.array([x.fisher_info_mat for x in usefull_values]),
-        jnp.array([x.step_mean for x in usefull_values]),
-        jnp.array([x.grad_mean for x in usefull_values]),
-        #jnp.array([x.end_heating for x in usefull_values]),
     )
 
 
@@ -257,4 +263,4 @@ Retdata = collections.namedtuple(
     ),
 )
 
-ResEstim = collections.namedtuple("ResEstim", ("theta", "evol_theta", "factor", "fisher_info_mat", "evol_fim","step_mean","grad_mean"))#,"end_heating"))
+ResEstim = collections.namedtuple("ResEstim", ("theta", "evol_theta", "factor", "fisher_info_mat", "evol_fim"))

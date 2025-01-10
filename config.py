@@ -1,1 +1,2 @@
-data = "real"
+model_name = "logistic"
+error = "constant"
